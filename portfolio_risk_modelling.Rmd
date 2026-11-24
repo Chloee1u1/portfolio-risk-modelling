@@ -1,0 +1,654 @@
+---
+title: "Portfolio Risk Modelling Using ARMA-GARCH and Copula Models"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+  html_document:
+    toc: true
+    number_sections: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+\newpage
+
+**Individual Contribution**
+
+
+
+**Group member 1** 
+
+- Provided text description for log-return, PIT, and re-introducing time series 
+- Developed code for re-introducing time series and Figure 5, refined code for VaR computation 
+- Checked report grammar, and organised structure of report and code
+
+
+**Group member 2** 
+
+- Collected and organised raw data, and provided text description and code for data collection 
+- Developed code for PIT, copula modelling and Figure 4, and VaR computation 
+- Provided text for copula modelling and VaR computation
+
+
+**Group member 3** 
+
+- Developed code for log-return, portfolio construction, time series and VaR computation 
+- Developed code for Figure 1-3, refined code and aesthetic for Figure 1-5 and Table 1-5 
+- Refined function for final model metrics, and organised structure of code
+
+
+**Group member 4** 
+
+- Developed function for loops of conditional distribution and final model metrics
+- Developed code and text for time series modelling, model selection and model testing 
+- Developed code for Table 1-5 and Figure 2-3, and organised structure of report
+
+
+**Group member 5** 
+
+- No contribution
+
+
+**Group member 6** 
+
+- No contribution
+
+\newpage
+
+# Data Organisation
+
+Among the six stock indices,S&P500 and CAC40 were selected to construct
+an equally-weighted portfolio.We used the weekly closing price from 1
+January 2000 to 31 December 2025. The data were combined and saved as a
+CSV file named “S&P500_CAC40.csv”.na.omit() was used to make sure there
+is no missing data.
+
+```{r org, echo=TRUE, message=FALSE}
+pacman::p_load(
+  tidyverse, # Data handling
+  VineCopula,
+  fGarch,
+  KScorrect,
+  ADGofTest,
+  fBasics,
+  kableExtra
+  )
+# Read data
+data <- read.csv("S&P500_CAC40.csv")
+set.seed(1)
+
+# Remove rows with missing values
+clean_data <- na.omit(data)
+
+# Format helper
+format_pvalue <- function(p) {
+  if (p < 0.001) return("p < 0.001")
+  else return(paste("p =", round(p, 3)))
+}
+```
+
+## Log-Return Plots
+
+Now we start to construct appropriate time series models. The figure
+below demonstrates log-return plots for both stocks. We can clearly
+observe patterns of volatility clustering from the plots, that is,
+periods of high volatility followed by high volatility, low volatility
+followed by low volatility.
+
+Both S&P500 and CAC40 indexes demonstrate extremely high volatility
+between 2008 and 2009, coinciding perfectly with the Global Financial
+Crisis. Similarly, both demonstrate high volatility in 2020 because of
+the outbreak of COVID-19. By contrast, during the period 2004-2007,
+2013-2019, the market shows low, gentle volatility. The CAC40 displays a
+relatively more obvious volatility pattern, but overall, both CAC40 and
+S&P500 show high similarity and synchronisation.This volatility
+clustering phenomenon suggests possible autocorrelation in volatility.
+
+```{r log_ret,echo=TRUE, fig.pos="H", fig.width=10, fig.height=8}
+# Compute weekly log-returns
+SP500_log_ret <- diff(log(clean_data$S.P500))
+CAC40_log_ret <- diff(log(clean_data$CAC40))
+
+# Calculate the variance-covariance matrix of log-returns
+log_ret_cov <- cov(data.frame(SP500_log_ret, CAC40_log_ret))
+
+#Create vector of portfolio weights, given they are equally-weighted
+weight <- matrix(c(0.5,0.5), nrow = 1)
+
+#Calculate portfolio variance
+portfolio_var <- weight %*% log_ret_cov %*% t(weight)
+
+#Create vector of expected log-returns
+mean <- matrix(c(mean(SP500_log_ret), mean(CAC40_log_ret)), nrow = 1)
+
+#Calculate expected log-return
+portfolio_mean <- weight %*% t(mean)
+
+#Calculate 95% and 99% VaR
+VaR_95 <- qnorm(0.95) * sqrt(portfolio_var) - portfolio_mean
+VaR_99 <- qnorm(0.99) * sqrt(portfolio_var) - portfolio_mean
+
+#Plot log-return plots
+dates <- as.Date(clean_data$Date[-1], format = "%Y/%m/%d")
+returns_data <- data.frame(
+  dates = dates,
+  SP500 = SP500_log_ret,
+  CAC40 = CAC40_log_ret
+)
+
+par(mfrow = c(2,1), oma = c(3,0,0,0))
+
+plot(returns_data$dates, returns_data$SP500, type="l", xlab = "Time (year)", 
+     ylab = "Log Returns", xlim = range(returns_data$dates), 
+     ylim = c(-0.21,0.12), yaxt = "n", main="S&P500", col = "blue")
+years_to_show = seq(2000, 2025, by = 5)
+year_dates = as.Date(paste0(years_to_show, "/01/01"))
+axis(1, at = year_dates, labels = years_to_show)
+axis(2, at = seq(-0.20, 0.12, by = 0.15))
+
+plot(returns_data$dates, returns_data$CAC40, type="l", xlab = "Time (year)",
+     ylab = "Log Returns", xlim = range(returns_data$dates), yaxt = "n",
+     main="CAC40", col = "darkgreen")
+axis(1, at = year_dates, labels = years_to_show)
+axis(2, at = seq(-0.25, 0.15, by = 0.15))
+mtext("Figure 1: Traceplots of log-returns for two stock indices", 
+      outer = TRUE, side = 1, line = 1)
+
+```
+
+# Constructing The Models
+
+## **Box-Jenkins Identification**
+
+To understand our data, we begin by assessing log-returns data against
+the assumption of normality to aid later model selection.
+
+```{r test1, echo=TRUE}
+# JB test
+SP500.jbt = format_pvalue(jarqueberaTest(SP500_log_ret)@test$p.value)
+CAC40.jbt = format_pvalue(jarqueberaTest(CAC40_log_ret)@test$p.value)
+
+# Skewness
+SP500.Skew = skewness(SP500_log_ret) # -1.080232
+CAC40.Skew = skewness(CAC40_log_ret) # -0.8701489
+
+# Kurtosis
+SP500.K = kurtosis(SP500_log_ret) # 7.074874
+CAC40.K = kurtosis(CAC40_log_ret) # 7.847156
+
+# DT Tables
+initialTests = tibble(
+  "Index" = c("S&P500", "CAC40"),
+  "Jarque-Bera Test" = c(SP500.jbt, CAC40.jbt),
+  "Skewness" = c(round(SP500.Skew, 2), round(CAC40.Skew, 2)),
+  "Kurtosis" = c(round(SP500.K, 2), round(CAC40.K, 2))
+)
+
+## Output Table
+kable(initialTests, 
+      caption = "Initial Data Overview",
+      booktabs = TRUE,
+      row.names = FALSE,
+      align = c("l","c","c","c")) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    full_width = FALSE,
+    font_size = 9
+  ) %>%
+  column_spec(1, bold = FALSE)%>%
+  row_spec(0, 
+           extra_css = "border-top: 1.5px solid black; border-bottom: 1.5px solid black;",
+           bold = FALSE) %>%
+  row_spec(nrow(initialTests), 
+           extra_css = "border-bottom: 1.5px solid black;") %>%
+  column_spec(1, bold = FALSE)
+```
+
+Table 1 reveals that for each model normality is rejected through
+significant Jarque-Bera tests at the 1% significant level, and strong
+negative skewness, indicating heavier left tails than under normality.
+These findings motivate the use of a heavy-tailed conditional
+distribution in subsequent modelling. Following this, we take a
+Box-Jenkin's approach to identify the order and volatility structures of
+each indices we produce three diagnostic plots. The following
+interpretations summarise our findings.
+
+```{r acf, echo=TRUE, fig.align='center', fig.height=6, fig.width=4.5, out.width="100%"}
+par(mfrow=c(3,2), oma = c(3,0,0,0), mar = c(3, 4, 1.5, 1))
+
+acf(SP500_log_ret, col="blue", lwd=2, main="", xlab="", ylab="")
+title(main="S&P500: ACF of Log-Returns", cex.main=0.8, cex.lab=0.7,
+      xlab="Lag (Weeks)", ylab="Autocorrelation")
+    
+acf(CAC40_log_ret, col="green", lwd=2, main="", xlab="", ylab="")
+title(main="CAC40: ACF of Log-Returns", cex.main=0.8, cex.lab=0.7,
+      xlab="Lag (Weeks)", ylab="Autocorrelation")
+acf(SP500_log_ret^2, col="blue", lwd=2, main="", xlab="", ylab="")
+title(main="S&P500: ACF of Squared Log-Returns", cex.main=0.8, cex.lab=0.7,
+      xlab="Lag (Weeks)", ylab="Autocorrelation")
+
+acf(CAC40_log_ret^2, col="green", lwd=2, main="", xlab="", ylab="")
+title(main="CAC40: ACF of Squared Log-Returns", cex.main=0.8, cex.lab=0.7,
+      xlab="Lag (Weeks)", ylab="Autocorrelation")
+
+pacf(SP500_log_ret, col="red", lwd=2, main="", xlab="", ylab="")
+title(main="S&P500: PACF of Log-Returns", cex.main=0.8, cex.lab=0.8,
+      xlab="Lag (Weeks)", ylab="Partial Autocorrelation")
+
+pacf(CAC40_log_ret, col="purple", lwd=2, main="", xlab="", ylab="")
+title(main="CAC40: PACF of Log-Returns", cex.main=0.8, cex.lab=0.7,
+      xlab="Lag (Weeks)", ylab="Partial Autocorrelation")
+
+mtext("Figure 2: ACF and PACF plots of log-returns and sqrt log-returns for 2 stock indices", 
+      outer = TRUE, side = 1, line = 1, cex = 0.6)
+```
+\newpage
+**ACF of Log-returns for S&P500 and CAC40**
+
+For both indices, autocorrelations are consistently contained within the
+95% confidence intervals. For S&P500, mild spikes occur around lags 2,
+9, 15, and 29, for CAC40, mild spikes occur around lags 2, 8, 14, 15,
+and 22. Due to the large number of observations in our data, and the
+mild nature of these breaches, we feel there is insufficient evidence to
+suggest true dependence, these lags likely exceed the bands by chance
+due to variability within our sample.
+
+**ACF of Squared Log-returns for S&P500 and CAC40**
+
+We use ACF of squared log-returns to assess whether an ARCH/GARCH model
+is required, as suggested by volatility clustering. Each index reflects
+slow, geometric decays indicataing conditional heteroskedasticity
+through persistence in autocorrelation. This provides sufficient
+evidence for use of GARCH(1,1) within our model, as commonly used with
+financial returns data.
+
+**PACF of Log-returns for S&P500 and CAC40**
+
+For both indices partial autocorrelation cuts off close to zero
+following lag 1. Several moderate breaches of the 95% confidence bands
+are found for both indices log-returns (e.g., lag 29 for S&P500 and lag
+31 for CAC40) , which we attribute to sample variability, given our
+large sample size (N=1,358), as opposed to true AR(29) and AR(31)
+models. Given lag 2 of S&P500 does not strongly breach the confidence
+bands, we proceed with an AR(1) model, including GARCH(1,1) effects.
+
+## Assessing Model Fit
+
+To confirm conditional distributions for each model, we compare
+AR(1)+GARCH(1,1) models for both S&P500 and CAC40 under 4 candidate
+distributions; normal distributions are excluded due to earlier
+rejection of normality. Models are compared across AIC and BIC,
+conditional on Ljung-Box test findings.
+
+```{r func1, echo=TRUE}
+whichConditionalFit = function(df, myCap) {
+  
+  myCap = gsub("&", "\\\\&", myCap) # Formating caption in Knit
+  
+  fitOne = function(ar.order) {
+    results = data.frame(); i = 1 # Initialise loop + table
+    formula = as.formula(paste0("~arma(1,0)+garch(1,1)")) # AR(1)GARCH(1,1) formula
+    models = list(
+      std   = garchFit(formula=formula, data=df, trace=F, cond.dist="std"), # Student-t
+      sstd  = garchFit(formula=formula, data=df, trace=F, cond.dist="sstd"), # Skewed Student-t
+      sged  = garchFit(formula=formula, data=df, trace=F, cond.dist="sged"), # Skewed GED
+      ged   = garchFit(formula=formula, data=df, trace=F, cond.dist="ged") # GED
+    )
+    model_names = c("Student-t", "Skew Student-t", "Skew GED", "GED") # Match with table
+    
+    for (i in seq_along(models)) { # Loop for all
+        model = models[[i]]
+        res        = residuals(model, standardize=TRUE)
+        lb_res     = Box.test(res,   lag=10, type="Ljung-Box", fitdf=1)
+        lb_res_sq  = Box.test(res^2, lag=10, type="Ljung-Box", fitdf=0)
+        results = rbind(results, data.frame(
+          "Model" = model_names[i],
+          "AIC" = round(model@fit$ics["AIC"], 2),
+          "BIC" = round(model@fit$ics["BIC"], 2),
+          `Ljung-Box` = round(lb_res$p.value, 2)
+        ))
+    }
+    results
+  }
+  
+  combined = fitOne(1)
+  
+  # Formatting
+  
+  kable(combined,
+        caption = myCap,
+        booktabs = TRUE,
+        row.names = FALSE,
+        col.names = c("Model", "AIC", "BIC", "Ljung-Box"),
+        align = c("l", rep("c", 3))) %>%
+    kable_styling(latex_options = c("hold_position"), full_width = FALSE, font_size = 9) %>%
+    add_header_above(c(" " = 1, "AR(1)-GARCH(1,1)" = 3)) %>%
+    row_spec(0, extra_css = "border-top: 1.5px solid black;") %>%
+    row_spec(nrow(combined),
+             extra_css = "border-bottom: 1.5px solid black;")
+}
+```
+
+```{r cd1, echo=TRUE}
+whichConditionalFit(SP500_log_ret, 'Selecting Conditional Distributions for SP500')
+whichConditionalFit(CAC40_log_ret, "Selecting Conditional Distributions for CAC40")
+```
+
+Tables 2 and 3 compare conditional distributions across both indices.
+Although Skewed Student-t shows marginally better BIC (-4.92 vs -4.89
+for S&P500, -4.52 vs -4.51 for CAC40), we select Student-t based on
+substantially stronger Ljung-Box results (0.66 vs 0.11, and 0.54 vs 0.18
+respectively), indicating superior residual diagnostics - and better
+overall fit. Below, we present our final models.
+
+# **Final Model Selection**
+
+```{r garch, echo=TRUE}
+SP500.Model = garchFit(formula=~arma(1,0)+garch(1,1), data=SP500_log_ret, trace=F, cond.dist="std")
+CAC40.Model = garchFit(formula=~arma(1,0)+garch(1,1), data=CAC40_log_ret, trace=F, cond.dist="std")
+```
+
+```{r func2, echo=TRUE}
+getSummaryMetrics = function(model, title) {
+  coef = model@fit$coef
+  
+  return(c(title, 
+           round(coef["mu"], 2),
+           round(coef["ar1"], 2),
+           round(coef["alpha1"], 2),
+           round(coef["beta1"], 2),
+           round(coef["shape"], 2)))
+}
+
+compareModels = function(model1, name1, model2, name2, myCap) {
+  myCap = gsub("&", "\\\\&", myCap)
+  results = data.frame()
+  
+  r1 = getSummaryMetrics(model1, name1)
+  r2 = getSummaryMetrics(model2, name2)
+  
+  results = rbind(results, r1, r2)
+  
+  colnames(results) = c("Model", "Weekly Mean", 
+                        "AR(1) Coefficient", "Shock Sensitivity",
+                        "Volatility Inertia", "Tail Shape")
+  
+  results = kable(results,
+                  caption = myCap,
+                  booktabs = TRUE,
+                  row.names = FALSE,
+                  align = c("l", rep("c", ncol(results) - 1))) %>%
+    kable_styling(
+      latex_options = c("hold_position"),
+      full_width = FALSE,
+      font_size = 9
+    )
+  return(results)
+}
+```
+
+Both models share in fat tails and highly persistence-driven volatility
+(both beta values \> 0.75). The S&P500 returns appear more shock-driven
+(0.20 vs 0.09), indicating it reacts more strongly to immediate market
+movements. While these models appear appropriate given PACF and
+information criterion, we now formally evaluate whether our models
+accurately characterise our data through PIT.
+
+```{r compare, echo=TRUE}
+compareModels(SP500.Model, "SP500", CAC40.Model, "CAC40", 
+              myCap = "Comparing Student-t models for SP500 and CAC40 (2 d.p.)")
+```
+
+# Copula Modelling
+
+## Probability Integral Transform
+
+We fitted a copula model to find out the dependence structure between
+the two stocks. To integrate the time series model with copula theory,
+we adopt the conditional distribution (student-t distribution) from our
+final models as the marginal distributions. To verify their adequacy, we
+executed the following steps:
+
+First, we extracted standardised residuals from our final models. As
+shown in the upper part of our plots, the histogram of standardised
+residuals perfectly matches the red fitted std density curves, showing
+it is reasonable to choose student-t distribution.
+
+Then we applied Probability Integral Transform (PIT) to those
+standardised residuals. If the marginal models are correctly specified,
+these transformed observations should strictly follow a standard uniform
+distribution. As observed in the lower part of the plot, the histograms
+are nearly uniform, showing that the marginal models are well-specified.
+
+We implemented the Kolmogorov-Smirnov (KS) test and the Anderson-Darling
+(AD) test on the PIT-transformed values. Both indices passed the KS test
+(p\>0.05), indicating a good overall fit. Although the AD test showed
+p\<0.05 due to its strict sensitivity to extreme tails, the uniform
+pattern in the histograms in Figure 3 still supports our fitting. Based
+on these results, we concluded that our chosen marginal models are
+adequate, providing a solid foundation for the subsequent copula
+modelling.
+
+```{r pit, echo=TRUE, message=FALSE, results='hide'}
+coef_SP500 <- SP500.Model@fit$coef
+coef_CAC40 <- CAC40.Model@fit$coef
+
+#PIT for S&P500
+res1 <- residuals(SP500.Model, standardize=TRUE)
+nu1 <- SP500.Model@fit$par["shape"]
+u1 <- pstd(res1, mean=0, sd=1, nu=nu1)
+
+# Implement Kolmogorov-Smirnov test
+KStest1<-LcKS(u1, cdf = "punif")
+invisible(KStest1$p.value)
+# Implement Anderson-Darling test
+ADtest1<-ad.test(u1, null="punif")
+invisible(ADtest1$p.value)
+
+#PIT for CAC40
+res2 <- residuals(CAC40.Model, standardize=TRUE)
+nu2 <- CAC40.Model@fit$par["shape"]
+u2 <- pstd(res2, mean=0, sd=1, nu=nu2)
+
+# Implement Kolmogorov-Smirnov test
+KStest2<-LcKS(u2, cdf = "punif")
+invisible(KStest2$p.value)
+# Implement Anderson-Darling test
+ADtest2<-ad.test(u2, null="punif")
+invisible(ADtest2$p.value)
+```
+
+```{r plot, echo=TRUE, fig.height=9, fig.width=13, message=FALSE}
+par(mfrow = c(2,2), oma = c(3,0,0,0))
+
+hist(res1, xlab = "S&P500 res", ylab = "density", 
+     main = "Histogram of S&P500 Model Residuals", 
+     ylim = c(0, max(c(hist(res1, plot=FALSE)$density, 0.5))), freq = FALSE)
+curve(dstd(x, mean = 0, sd = 1, nu = nu1), add = TRUE, col = "red", lwd = 2)
+legend("topleft", legend = "Student-t distribution", lty = 1, 
+       col = "red", bty = "n")
+hist(res2, xlab = "CAC40 res", ylab = "density", 
+     main = "Histogram of CAC40 Model Residuals", 
+     ylim = c(0, max(c(hist(res2, plot=FALSE)$density, 0.5))), freq = FALSE)
+curve(dstd(x, mean = 0, sd = 1, nu = nu2), add = TRUE, col = "red", lwd = 2)
+legend("topleft", legend = "Student-t distribution", lty = 1, col = "red")
+
+hist(u1,xlab = "S&P500 u", 
+     main = "Histogram of S&P500 Model Residuals after PIT", ylim = c(0,200))
+hist(u2,xlab = "CAC40 u", 
+     main = "Histogram of CAC40 Model Residuals after PIT", ylim = c(0,200))
+mtext("Figure 3: Histogram of residual distribution before and after PIT for two stock indices", 
+      outer = TRUE, side = 1, line = 2) 
+```
+
+## Copula-based Monte Carlo Simulation
+
+In this step, we use `BiCopSelect` to fit copula model.The results
+suggest us to use t copula based on the AIC criterion, with estimated
+parameter par = 0.75, par2 = 6.11, tau = 0.54.
+
+```{r copula1, echo=TRUE, fig.height=5, fig.width=10}
+model <- BiCopSelect(u1, u2,familyset = NA, selectioncrit = "AIC", 
+                     indeptest = TRUE, level = 0.05)
+```
+
+Then we generated 10000 simulated bivariate samples to create the
+Simulated copula plot and compare it with the observed copula plot. We
+also applied the Inverse Probability Integral Transform (IPIT) to
+convert them into simulated standardised residuals. As shown in Figure
+4, both copula plots show a clear lower-tail dependence, which suggests
+that the simulated copula captures the key characteristics of the
+dependence structure well. This indicates that large negative returns in
+these two stocks happen together.
+
+```{r copula2, echo=TRUE, fig.height=5, fig.width=10}
+#set the length of the simulated bivariate sample
+N <- 10000
+
+# Should we consider using this for N?
+# N = nrow(clean_data)
+
+set.seed(1234)
+u_sim <- BiCopSim(N,family = 2,par = model$par,
+                  par2 = model$par2)
+
+# Apply the component-wise Inverse Probability Integral Transform 
+# SP500_sim<-qsstd(u_sim [,1],nu=nu1,xi=coef_SP500["skew"])
+# CAC40_sim<-qsstd(u_sim [,2],nu=nu2,xi=coef_CAC40["skew"])
+
+## Use "qtsd" instead. 
+# Mean = 0, SD = 1 
+SP500_sim <- qstd(u_sim[,1], mean=0, sd=1, nu=nu1)
+CAC40_sim <- qstd(u_sim[,2], mean=0, sd=1, nu=nu2)
+
+par(mfrow=c(1,2), mar = c(2, 2.5, 4, 1), oma = c(3, 0, 0, 0))
+#Plot the Observed copula
+plot(u1, u2, pch = 16, cex = 0.5, col = adjustcolor("gray37", alpha.f=0.4), 
+     xlab = "S&P500", ylab = "CAC40", main = "Observed copula")
+
+#Plot the simulated copula
+plot(u_sim[,1], u_sim[,2], pch = 16, cex = 0.5, 
+     col=adjustcolor("gray37",alpha.f=0.4), xlab = "S&P500",
+     ylab = "CAC40", main = "Simulated copula")
+mtext("Figure 4: Plot of observed and simulated copula", outer = TRUE, side = 1, line = 2) 
+```
+
+## Re-introducing Time Series Effects
+
+For more realistic prediction of future returns, we re-introduced time
+series effects observed in our original data. Specifically, we extracted
+relevant parameters ($\mu$, $ar_1$, $\omega$, $\alpha$, $\beta$) from
+previously built AR and GARCH models. Then, we introduced the last
+return and volatility from the dataset and updated forward conditional
+volatility $\sigma$. Following that, we rebuilt the simulated log
+returns using these real parameters.
+
+```{r ts, echo=TRUE}
+# Re-introduce autocorrelation and GARCH effects observed in data
+# Extract coefficients for S&P500
+omega_S <- coef_SP500["omega"]
+alpha_S <- coef_SP500["alpha1"]
+beta_S <- coef_SP500["beta1"]
+mu_S <- coef_SP500["mu"]
+ar1_S <- coef_SP500["ar1"]
+
+# Extract coefficients for CAC40
+omega_C <- coef_CAC40["omega"]
+alpha_C <- coef_CAC40["alpha1"]
+beta_C <- coef_CAC40["beta1"]
+mu_C <- coef_CAC40["mu"]
+ar1_C <- coef_CAC40["ar1"]
+
+# Extract the last non-standardised residuals from the model u
+u_last_SP500 <- tail(residuals(SP500.Model, standardize = FALSE), 1)
+u_last_CAC40 <- tail(residuals(CAC40.Model, standardize = FALSE), 1)
+
+# Extract the last estimated conditional standard deviation from the model
+sigma_last_SP500 <- tail(SP500.Model@sigma.t, 1)
+sigma_last_CAC40 <- tail(CAC40.Model@sigma.t, 1)
+
+# Extract the last observed log-return
+y_last_SP500 <- tail(SP500_log_ret, 1)
+y_last_CAC40 <- tail(CAC40_log_ret, 1)
+
+# Update the conditional variance
+sigma_sim_SP500 <- sqrt(omega_S + alpha_S * u_last_SP500^2 + beta_S * sigma_last_SP500^2)
+sigma_sim_CAC40 <- sqrt(omega_C + alpha_C * u_last_CAC40^2 + beta_C * sigma_last_CAC40^2)
+
+# Reconstruct the simulated one-step-ahead return
+yS_simulated <- mu_S + ar1_S * y_last_SP500 + sigma_sim_SP500 * SP500_sim
+yC_simulated <- mu_C + ar1_C * y_last_CAC40 + sigma_sim_CAC40 * CAC40_sim
+```
+
+## Plotting Original vs Simulated Log-returns
+
+To test the validity of our simulation, we compared simulated log
+returns with original log returns using Figure 5 below. We could easily
+observe the strong overlap of simulated data (grey points) with original
+data (red points) both in the central area and the tails. This suggests
+that our model successfully reflects the joint distribution properties
+of S&P500 and CAC40 in the real financial market.
+
+```{r comp, echo=TRUE, fig.height=4, fig.width=7}
+par(mfrow = c(1, 1), mar = c(4, 4, 2, 1), cex = 0.8, oma = c(3, 0, 0, 0))
+
+plot(SP500_log_ret, CAC40_log_ret, pch = 16, cex = 0.4, 
+     col = adjustcolor("red", alpha.f = 0.4), xlab = "S&P500", ylab = "CAC40",
+     main = "Distribution of Log-returns", 
+     xlim = c(-0.1, 0.1), ylim = c(-0.12, 0.12)) 
+points(yS_simulated, yC_simulated, pch = 16, cex = 0.3, 
+       col = adjustcolor("gray50", alpha.f = 0.2))
+legend("topleft", legend = c("Original data", "Simulated data"),
+       col = c(adjustcolor("red", alpha.f = 0.6), adjustcolor("gray50", alpha.f = 0.6)), 
+       pch = 16, pt.cex = 1.2, bty = "n")
+mtext("Figure 5: Plot of original & simulated log-returns", outer = TRUE, side = 1, line = 2) 
+```
+
+## Compute Value-at-Risk
+
+We estimate the 99% and 95% Value-at-Risk using Monte Carlo
+simulation.The table below shows that 1-week VaR at 95% and 99%
+confidence interval is 2.28% and 3.83%,respectively.With £1 million
+invested, we are 95% confident that we will not lose more than £22,800
+from investing over the next week and 99% confident that we will not
+lose more than £38,300 from investing over the next week.
+
+```{r var, echo=TRUE}
+# Compute Value-at-Risk for the equally-weighted portfolio
+port_sim <- log(1 + ((exp(yS_simulated) - 1) + (exp(yC_simulated) - 1)) * (1/2))
+
+getVarVal = function(alpha) {
+  value = round(-quantile(port_sim, 1 - as.numeric(alpha)),4)
+}
+
+var_sim = data.frame(
+  "Alpha Level" = c("95%", "99%"),
+  "Value-at-Risk" = c(getVarVal(0.95), getVarVal(0.99))
+)
+
+kable(var_sim, 
+      caption = "Percentage Value-at-Risk for Balance Portfolio",
+      booktabs = TRUE,
+      row.names = FALSE,
+      align = c("l", "c")) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    full_width = FALSE,
+    font_size = 9
+  ) %>%
+  column_spec(1, bold = FALSE)%>%
+  row_spec(0,
+           extra_css = "border-top: 1.5px solid black; 
+           border-bottom: 1.5px solid black;",
+           bold = FALSE) %>%
+  row_spec(nrow(var_sim),
+           extra_css = "border-bottom: 1.5px solid black;") %>%
+  column_spec(1, bold = FALSE)
+```
